@@ -1,12 +1,25 @@
-from agentic_chabot_with_db import chatbot ,get_all_threads
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+from agentic_chatbot_rag_backend import (
+    chatbot,
+    get_all_threads,
+    ingest_rag_document
+)
+
+from langchain_core.messages import (
+    BaseMessage,
+    HumanMessage,
+    AIMessage,
+    ToolMessage
+)
+
 import streamlit as st
-import uuid 
+import uuid
+import tempfile
+import os
+
 
 # Generate a unique thread ID for each new conversation
 def generate_thread_id():
     return str(uuid.uuid4())
-
 
 
 # Add a new thread ID to the conversation list
@@ -16,7 +29,6 @@ def add_thread(thread_id):
     if thread_id not in st.session_state["chat_threads"]:
         st.session_state["chat_threads"].append(thread_id)
 
-    
 
 # Create a completely new chat conversation
 def reset_chat():
@@ -29,7 +41,6 @@ def reset_chat():
 
     # Add the new thread to the conversation list
     add_thread(st.session_state["thread_id"])
-
 
 
 # Load a previous conversation from the LangGraph checkpointer
@@ -49,6 +60,10 @@ def load_conversation(thread_id):
     return state.values.get("messages", [])
 
 
+st.set_page_config(
+    page_title="Agentic Chatbot",
+    page_icon="🤖"
+)
 
 # Display the main application title
 st.title("Agentic Chatbot with LangGraph")
@@ -67,7 +82,6 @@ if "thread_id" not in st.session_state:
 # Create a list for storing all conversation thread IDs
 if "chat_threads" not in st.session_state:
     st.session_state["chat_threads"] = get_all_threads()
-
 
 
 # Add the current thread to the conversation list
@@ -90,8 +104,6 @@ if st.sidebar.button("New Chat"):
     st.rerun()
 
 
-
-
 # Display all conversation threads in reverse order
 # This shows the newest conversation first
 for thread_id in st.session_state["chat_threads"][::-1]:
@@ -112,7 +124,6 @@ for thread_id in st.session_state["chat_threads"][::-1]:
         # into Streamlit's required message format
         temp_messages = []
 
-
         # Loop through all saved messages
         for message in messages:
 
@@ -128,20 +139,17 @@ for thread_id in st.session_state["chat_threads"][::-1]:
             else:
                 continue
 
-
             # Convert the LangChain message into a dictionary
             temp_messages.append({
                 "role": role,
                 "content": message.content
             })
 
-
         # Replace the current UI history with the selected conversation
         st.session_state["message_history"] = temp_messages
 
         # Rerun the application to display the loaded messages
         st.rerun()
-
 
 
 # ========================= Main chat interface =========================
@@ -156,12 +164,91 @@ for message in st.session_state["message_history"]:
         st.text(message["content"])
 
 
+# ========================= Fixed chat input with PDF upload =========================
 
-# Create the chat input box
-user_input = st.chat_input("Type here")
+# Keep st.chat_input directly in the main body.
+# This keeps it fixed at the bottom of the screen.
+#
+# accept_file=True adds the attachment button inside the chat input.
+# file_type=["pdf"] allows PDF files only.
+submission = st.chat_input(
+    "Type here",
+    accept_file=True,
+    file_type=["pdf"]
+)
 
 
-# Run this block after the user submits a message
+# Default user input value
+user_input = None
+
+
+# Process the submitted text and PDF
+if submission:
+
+    # Get the text entered by the user
+    user_input = submission.text
+
+    # Get the uploaded files
+    # This is always a list when accept_file is enabled
+    uploaded_files = submission.files
+
+    # Process the uploaded PDF if one was attached
+    if uploaded_files:
+
+        uploaded_pdf = uploaded_files[0]
+
+        # Store the temporary file path
+        temporary_file_path = None
+
+        try:
+
+            # Save the uploaded PDF as a temporary local file
+            with tempfile.NamedTemporaryFile(
+                delete=False,
+                suffix=".pdf"
+            ) as temporary_file:
+
+                temporary_file.write(
+                    uploaded_pdf.getvalue()
+                )
+
+                temporary_file_path = temporary_file.name
+
+
+            # Call the backend RAG ingestion function
+            with st.spinner(
+                f"Processing {uploaded_pdf.name}..."
+            ):
+
+                ingest_rag_document(
+                    temporary_file_path
+                )
+
+
+            # Display PDF processing confirmation
+            st.toast(
+                f"{uploaded_pdf.name} processed successfully.",
+                icon="✅"
+            )
+
+        except Exception as error:
+
+            # Display PDF processing error
+            st.error(
+                f"PDF processing failed: {error}"
+            )
+
+        finally:
+
+            # Delete the temporary PDF after indexing
+            if (
+                temporary_file_path
+                and os.path.exists(temporary_file_path)
+            ):
+                os.remove(temporary_file_path)
+
+
+# Run this block after the user submits a text message
 if user_input:
 
     # Save the user's message in Streamlit session state
@@ -181,39 +268,77 @@ if user_input:
     CONFIG = {
         "configurable": {
             "thread_id": st.session_state["thread_id"]
-        }
+        },
+        "metadata": {
+            "thread_id": st.session_state["thread_id"]
+        },
+        "run_name": "chat_trace",
     }
 
 
-    # Create the assistant chat-message container
+    # Assistant streaming block
     with st.chat_message("assistant"):
 
-        # Stream the assistant response token by token
-        ai_message = st.write_stream(
+        # Use a mutable holder so the generator can set/modify it
+        status_holder = {"box": None}
 
-            # Return only the content of AI message chunks
-            message_chunk.content
 
-            # Stream messages from the LangGraph chatbot
+        def ai_only_stream():
+
             for message_chunk, metadata in chatbot.stream(
                 {
-                    # Send the latest user message to the chatbot
                     "messages": [
                         HumanMessage(content=user_input)
                     ]
                 },
-
-                # Use the current conversation thread
                 config=CONFIG,
+                stream_mode="messages",
+            ):
 
-                # Stream individual message chunks
-                stream_mode="messages"
-            )
+                # Lazily create & update the SAME status container
+                # when any tool runs
+                if isinstance(message_chunk, ToolMessage):
 
-            # Display only AI messages
-            # This prevents tool and user messages from appearing
-            if isinstance(message_chunk, AIMessage)
+                    tool_name = getattr(
+                        message_chunk,
+                        "name",
+                        "tool"
+                    )
+
+                    if status_holder["box"] is None:
+
+                        status_holder["box"] = st.status(
+                            f"🔧 Using `{tool_name}` …",
+                            expanded=True
+                        )
+
+                    else:
+
+                        status_holder["box"].update(
+                            label=f"🔧 Using `{tool_name}` …",
+                            state="running",
+                            expanded=True,
+                        )
+
+
+                # Stream ONLY assistant tokens
+                if isinstance(message_chunk, AIMessage):
+                    yield message_chunk.content
+
+
+        ai_message = st.write_stream(
+            ai_only_stream()
         )
+
+
+        # Finalize only if a tool was actually used
+        if status_holder["box"] is not None:
+
+            status_holder["box"].update(
+                label="✅ Tool finished",
+                state="complete",
+                expanded=False
+            )
 
 
     # Save the complete assistant response in Streamlit session state

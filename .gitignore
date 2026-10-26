@@ -2,3 +2,4 @@
 venv/
 __pycache__/
 *.pyc
+faiss_pdf_index/
