@@ -1,4 +1,4 @@
-from agentic_chatbot import chatbot
+from agentic_chatbot_backend import chatbot
 from langchain_core.messages import BaseMessage,HumanMessage
 import streamlit as st
 config = {'configurable': {'thread_id': 'thread1'}}
